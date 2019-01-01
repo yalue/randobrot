@@ -3,10 +3,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <hip/hip_runtime.h>
+#include <hiprand/hiprand.h>
+#include <hiprand/hiprand_kernel.h>
 
 // The device number on which to perform the computation.
 #define DEVICE_ID (0)
+
+// The number of GPU threads to use when searching for interesting locations.
+#define SEARCH_THREAD_COUNT (2048)
+
+// The number of times each thread retries searching for a good location.
+#define RETRIES_PER_THREAD (512)
 
 // This macro takes a hipError_t value and exits if it isn't equal to
 // hipSuccess.
@@ -30,6 +39,9 @@ typedef struct {
 
 // This sets the minimum and/or maximum iterations for a fractal.
 typedef struct {
+  // This is the minimum number of iterations to run when searching for an
+  // interesting starting point. Unused when rendering a full image.
+  uint32_t min_iterations;
   // This is the maximum number of iterations to run to see whether a point
   // escapes.
   uint32_t max_iterations;
@@ -56,6 +68,44 @@ typedef struct {
   double linear_scale;
 } IterationColorStats;
 
+// This contains parameters and outputs used when searching for interesting
+// locations.
+typedef struct {
+  // A list of RNG states for the search. There must be one such state per
+  // search thread.
+  hiprandState_t *rng_states;
+  // A list of real locations, 1 per thread, containing the interesting point.
+  // This will be less than -2 if the associated thread did not find an
+  // interesting point.
+  double *real_locations;
+  // Like real_locations, except holds the imaginary location for corresponding
+  // threads.
+  double *imag_locations;
+  // This holds the iterations needed for the interesting point in each
+  // corresponding thread. This will be set to 0 or max_iterations if no
+  // interesting point was found by the thread.
+  uint32_t *iterations_needed;
+  IterationControl iterations;
+} RandomSearchData;
+
+static void InternalHIPErrorCheck(hipError_t result, const char *fn,
+    const char *file, int line) {
+  if (result == hipSuccess) return;
+  printf("HIP error %d: %s. In %s, line %d (%s)\n", (int) result,
+    hipGetErrorString(result), file, line, fn);
+  exit(1);
+}
+
+// Uses the current time in nanoseconds to get an RNG seed.
+static uint64_t GetRNGSeed(void) {
+  uint64_t to_return = 0;
+  struct timespec t;
+  clock_gettime(CLOCK_REALTIME, &t);
+  to_return = t.tv_nsec;
+  to_return += t.tv_sec * 1e9;
+  return to_return;
+}
+
 static void CleanupImage(MandelbrotImage *m) {
   if (m->data) hipFree(m->data);
   memset(m, 0, sizeof(*m));
@@ -67,12 +117,139 @@ static size_t GetBufferSize(MandelbrotImage *m) {
   return m->dimensions.w * m->dimensions.h * sizeof(uint32_t);
 }
 
-static void InternalHIPErrorCheck(hipError_t result, const char *fn,
-    const char *file, int line) {
-  if (result == hipSuccess) return;
-  printf("HIP error %d: %s. In %s, line %d (%s)\n", (int) result,
-    hipGetErrorString(result), file, line, fn);
-  exit(1);
+static void AllocateDeviceMemory(MandelbrotImage *m) {
+  size_t bytes_needed = GetBufferSize(m);
+  CheckHIPError(hipMalloc(&(m->data), bytes_needed));
+}
+
+// Update the delta_real and delta_imag values in the image dimensions.
+static void UpdatePixelWidths(FractalDimensions *dims) {
+  double tmp = dims->max_real - dims->min_real;
+  dims->delta_real = tmp / ((double) dims->w);
+  tmp = dims->max_imag - dims->min_imag;
+  dims->delta_imag = tmp / ((double) dims->h);
+}
+
+// Initializes the Mandelbrot image with some basic defaults.
+static void InitializeImage(MandelbrotImage *m, int w, int h) {
+  if ((w <= 0) || (h <= 0)) {
+    printf("Bad image width or height.\n");
+    exit(1);
+  }
+  m->dimensions.w = w;
+  m->dimensions.h = h;
+  m->dimensions.min_real = -2;
+  m->dimensions.min_imag = -2;
+  m->dimensions.max_real = 2;
+  m->dimensions.max_imag = 2;
+  m->iterations.min_iterations = 0;
+  m->iterations.max_iterations = 100;
+  m->iterations.escape_radius = 2;
+  UpdatePixelWidths(&(m->dimensions));
+  AllocateDeviceMemory(m);
+}
+
+__global__ void InitializeRNG(uint64_t seed, hiprandState_t *states) {
+  int index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+  if (index > SEARCH_THREAD_COUNT) return;
+  hiprand_init(seed, index, 0, states + index);
+}
+
+// Initializes the GPU memory and RNG states for the random search.
+static void InitializeRandomSearchData(RandomSearchData *d,
+    IterationControl *c) {
+  int count = SEARCH_THREAD_COUNT;
+  int block_count = count / 256;
+  if ((count % 256) != 0) block_count++;
+  CheckHIPError(hipMalloc(&(d->rng_states), count * sizeof(hiprandState_t)));
+  CheckHIPError(hipMalloc(&(d->real_locations), count * sizeof(double)));
+  CheckHIPError(hipMemset(d->real_locations, 0, count * sizeof(double)));
+  CheckHIPError(hipMalloc(&(d->imag_locations), count * sizeof(double)));
+  CheckHIPError(hipMemset(d->imag_locations, 0, count * sizeof(double)));
+  CheckHIPError(hipMalloc(&(d->iterations_needed), count * sizeof(uint32_t)));
+  CheckHIPError(hipMemset(d->iterations_needed, 0, count * sizeof(uint32_t)));
+  d->iterations = *c;
+  hipLaunchKernelGGL(InitializeRNG, block_count, 256, 0, 0, GetRNGSeed(),
+    d->rng_states);
+  CheckHIPError(hipDeviceSynchronize());
+}
+
+// Frees all of the memory in the RandomSearchData struct.
+static void CleanupRandomSearchData(RandomSearchData *d) {
+  CheckHIPError(hipFree(d->rng_states));
+  CheckHIPError(hipFree(d->real_locations));
+  CheckHIPError(hipFree(d->imag_locations));
+  CheckHIPError(hipFree(d->iterations_needed));
+  memset(d, 0, sizeof(*d));
+}
+
+// This returns nonzero if the given point is in the main cardioid of the set
+// and is therefore guaranteed to not escape.
+__device__ int InMainCardioid(double real, double imag) {
+  // This algorithm was taken from the Wikipedia Mandelbrot set page.
+  double imag_squared = imag * imag;
+  double q = (real - 0.25);
+  q = q * q + imag_squared;
+  return q * (q + (real - 0.25)) < (imag_squared * 0.25);
+}
+
+// This returns nonzero if the given point is in the order 2 bulb of the set
+// and therefore guaranteed to not escape.
+__device__ int InOrder2Bulb(double real, double imag) {
+  double tmp = real + 1;
+  tmp = tmp * tmp;
+  return (tmp + (imag * imag)) < (1.0 / 16.0);
+}
+
+// Returns the number of iterations required for the given point to escape the
+// mandelbrot set. Returns max_iterations if the point never escapes.
+__device__ uint32_t GetMandelbrotIterations(double real, double imag,
+    uint32_t max_iterations, double escape_radius) {
+  if (InMainCardioid(real, imag)) return max_iterations;
+  if (InOrder2Bulb(real, imag)) return max_iterations;
+  uint32_t iteration = 0;
+  double radius_squared = escape_radius * escape_radius;
+  double start_real = real;
+  double start_imag = imag;
+  double tmp;
+  for (iteration = 0; iteration < max_iterations; iteration++) {
+    if (((real * real) + (imag * imag)) >= radius_squared) break;
+    tmp = (real * real) - (imag * imag) + start_real;
+    imag = 2 * real * imag + start_imag;
+    real = tmp;
+  }
+  return iteration;
+}
+
+// Performs the random search for interesting Mandelbrot set locations. Fills
+// in the location and iteration data if an interesting location is found.
+__global__ void DoRandomSearch(RandomSearchData d) {
+  int try_number;
+  uint32_t iterations;
+  double real, imag;
+  uint32_t min_iterations = d.iterations.min_iterations;
+  uint32_t max_iterations = d.iterations.max_iterations;
+  int index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+  hiprandState_t *rng = d.rng_states + index;
+  if (index > SEARCH_THREAD_COUNT) return;
+  d.iterations_needed[index] = 0;
+  d.real_locations[index] = -3;
+  d.imag_locations[index] = -3;
+  for (try_number = 0; try_number < RETRIES_PER_THREAD; try_number++) {
+    // Get a random point within the 4x4 area at the center of the complex
+    // plane.
+    real = hiprand_uniform_double(rng) * 4.0 - 2.0;
+    imag = hiprand_uniform_double(rng) * 4.0 - 2.0;
+    iterations = GetMandelbrotIterations(real, imag, max_iterations,
+      d.iterations.escape_radius);
+    if (iterations < min_iterations) continue;
+    if (iterations >= max_iterations) continue;
+    // We found a point within the iteration bounds.
+    d.iterations_needed[index] = iterations;
+    d.real_locations[index] = real;
+    d.imag_locations[index] = imag;
+    return;
+  }
 }
 
 // This uses a 2-D grid of threads. The x and y dimensions must cover the
@@ -89,10 +266,11 @@ __global__ void DrawMandelbrot(MandelbrotImage m) {
   double start_imag = m.dimensions.delta_imag * row + m.dimensions.min_imag;
   double current_real = start_real;
   double current_imag = start_imag;
-  double radius = m.iterations.escape_radius;
+  double radius_squared = m.iterations.escape_radius;
+  radius_squared *= radius_squared;
   for (iteration = 0; iteration < m.iterations.max_iterations; iteration++) {
     if (((current_real * current_real) + (current_imag * current_imag)) >=
-      radius) {
+      radius_squared) {
       break;
     }
     tmp = (current_real * current_real) - (current_imag * current_imag) +
@@ -103,17 +281,106 @@ __global__ void DrawMandelbrot(MandelbrotImage m) {
   m.data[index] = iteration;
 }
 
-static void AllocateDeviceMemory(MandelbrotImage *m) {
-  size_t bytes_needed = GetBufferSize(m);
-  CheckHIPError(hipMalloc(&(m->data), bytes_needed));
+// Returns the base-2 log of v, as an integer. This is equivalent to the
+// position of the highest bit in v.
+static uint32_t IntLog2(uint32_t v) {
+  uint32_t to_return = 0;
+  while (v != 0) {
+    to_return++;
+    v = v >> 1;
+  }
+  return to_return;
 }
 
-// Update the delta_real and delta_imag values in the image dimensions.
-static void UpdatePixelWidths(FractalDimensions *dims) {
-  double tmp = dims->max_real - dims->min_real;
-  dims->delta_real = tmp / ((double) dims->w);
-  tmp = dims->max_imag - dims->min_imag;
-  dims->delta_imag = tmp / ((double) dims->h);
+// Initializes the given image struct to render a Mandelbrot image centered on
+// the given real, imaginary coordinate. Automatically calculates bounds based
+// on the number of iterations needed.
+static void InitializeImageBox(MandelbrotImage *image, double real,
+    double imag, uint32_t max_iterations, int width) {
+  double box_width = 0.0;
+  // This only handles square images for now.
+  InitializeImage(image, width, width);
+  // We can leave min_iterations at 0, but set the other fields to ensure that
+  // we'll get data at the spot we found randomly.
+  image->iterations.max_iterations = max_iterations;
+  image->iterations.min_iterations = 0;
+  image->iterations.escape_radius = 2.1;
+
+  // TODO: Actually calculate a dynamic box width.
+  box_width = 1.0e-8;
+  printf("Location at %f+%fi with %u iterations has box width %f\n",
+    real, imag, (unsigned) max_iterations, box_width);
+  image->dimensions.min_real = real - box_width / 2;
+  image->dimensions.max_real = real + box_width / 2;
+  image->dimensions.min_imag = imag - box_width / 2;
+  image->dimensions.max_imag = imag + box_width / 2;
+  UpdatePixelWidths(&(image->dimensions));
+}
+
+// Randomly searches for interesting Mandelbrot-set images. Requires a buffer
+// of up to max_images MandelbrotImage structs to fill. Returns the number of
+// images actually found. Requires an IterationControl object to constrain the
+// search for interesting images.
+static int GetRandomImages(MandelbrotImage *images, int max_images,
+    IterationControl *iterations, int width) {
+  RandomSearchData d;
+  double *host_real = NULL;
+  double *host_imag = NULL;
+  uint32_t *host_iterations = NULL;
+  int images_found = 0;
+  int i = 0;
+  size_t copy_size = 0;
+
+  // First, perform the search for the random Mandelbrot images on the GPU.
+  InitializeRandomSearchData(&d, iterations);
+  int block_count = SEARCH_THREAD_COUNT / 256;
+  if ((block_count % 256) != 0) block_count++;
+  hipLaunchKernelGGL(DoRandomSearch, block_count, 256, 0, 0, d);
+  CheckHIPError(hipDeviceSynchronize());
+
+  // Next, copy the found image locations to the host.
+  copy_size = SEARCH_THREAD_COUNT * sizeof(double);
+  host_real = (double *) malloc(copy_size);
+  if (!host_real) {
+    printf("Failed allocating buffer for host real values.\n");
+    return 0;
+  }
+  CheckHIPError(hipMemcpy(host_real, d.real_locations, copy_size,
+    hipMemcpyDeviceToHost));
+  host_imag = (double *) malloc(copy_size);
+  if (!host_imag) {
+    printf("Failed allocating buffer for host imaginary values.\n");
+    free(host_real);
+    return 0;
+  }
+  CheckHIPError(hipMemcpy(host_imag, d.imag_locations, copy_size,
+    hipMemcpyDeviceToHost));
+  copy_size = SEARCH_THREAD_COUNT * sizeof(uint32_t);
+  host_iterations = (uint32_t *) malloc(copy_size);
+  if (!host_iterations) {
+    printf("Failed allocating buffer for host iteration counts.\n");
+    free(host_real);
+    free(host_imag);
+    return 0;
+  }
+  CheckHIPError(hipMemcpy(host_iterations, d.iterations_needed, copy_size,
+    hipMemcpyDeviceToHost));
+  CleanupRandomSearchData(&d);
+
+  // Next, iterate over the found locations and initialize the Mandelbrot-set
+  // image structs with the correct locations. (Note that it's pointless to set
+  // max_images to something higher than SEARCH_THREAD_COUNT).
+  for (i = 0; i < SEARCH_THREAD_COUNT; i++) {
+    if (host_iterations[i] == 0) continue;
+    InitializeImageBox(images + images_found, host_real[i], host_imag[i],
+      host_iterations[i], width);
+    images_found++;
+    if (images_found >= max_images) break;
+  }
+  free(host_real);
+  free(host_imag);
+  free(host_iterations);
+  return images_found;
 }
 
 // Copies image data from the device buffer to a host buffer.
@@ -235,22 +502,43 @@ static int SaveImage(MandelbrotImage *m, const char *filename) {
   return 1;
 }
 
-// Initializes the Mandelbrot image with some basic defaults.
-static void InitializeImage(MandelbrotImage *m, int w, int h) {
-  if ((w <= 0) || (h <= 0)) {
-    printf("Bad image width or height.\n");
-    exit(1);
+static void GenerateImages(int count, int width, const char *dir) {
+  int number_found, i;
+  char image_filename[1024];
+  MandelbrotImage *images = NULL;
+  IterationControl iterations;
+  dim3 block_dim(16, 16);
+  dim3 grid_dim((width / 16) + 1, (width / 16) + 1);
+  memset(&iterations, 0, sizeof(iterations));
+  iterations.max_iterations = 40000;
+  iterations.min_iterations = 10000;
+  iterations.escape_radius = 4.0;
+  images = (MandelbrotImage *) malloc(count * sizeof(MandelbrotImage));
+  if (!images) {
+    printf("Failed allocating list of Mandelbrot images.\n");
+    return;
   }
-  m->dimensions.w = w;
-  m->dimensions.h = h;
-  m->dimensions.min_real = -2;
-  m->dimensions.min_imag = -2;
-  m->dimensions.max_real = 2;
-  m->dimensions.max_imag = 2;
-  m->iterations.max_iterations = 100;
-  m->iterations.escape_radius = 2;
-  UpdatePixelWidths(&(m->dimensions));
-  AllocateDeviceMemory(m);
+  number_found = GetRandomImages(images, count, &iterations, width);
+  printf("Found %d images.\n", number_found);
+  if (!number_found) {
+    free(images);
+    return;
+  }
+  for (i = 0; i < number_found; i++) {
+    memset(image_filename, 0, sizeof(image_filename));
+    snprintf(image_filename, sizeof(image_filename), "%s/%d.ppm", dir, i);
+    printf("Rendering image %d of %d...\n", i, number_found);
+    hipLaunchKernelGGL(DrawMandelbrot, grid_dim, block_dim, 0, 0, images[i]);
+    CheckHIPError(hipDeviceSynchronize());
+    if (!SaveImage(images + i, image_filename)) {
+      printf("Failed saving image %s\n", image_filename);
+    } else {
+      printf("Image saved as %s\n", image_filename);
+    }
+    CleanupImage(images + i);
+  }
+  free(images);
+  images = NULL;
 }
 
 // Sets the HIP device and prints out some device info.
@@ -266,19 +554,24 @@ static void SetupDevice(void) {
 }
 
 int main(int argc, char **argv) {
+  int count, resolution;
   MandelbrotImage m;
-  SetupDevice();
-  InitializeImage(&m, 1000, 1000);
-  // Blocks are 16x16 threads
-  dim3 block_dim(16, 16);
-  dim3 grid_dim((1000 / 16) + 1, (1000 / 16) + 1);
-  hipLaunchKernelGGL(DrawMandelbrot, grid_dim, block_dim, 0, 0, m);
-  CheckHIPError(hipDeviceSynchronize());
-  if (!SaveImage(&m, "output.ppm")) {
-    printf("Failed saving image.\n");
-  } else {
-    printf("Image saved OK.\n");
+  if (argc != 4) {
+    printf("Usage: %s <max # of images> <image width> <output directory>\n",
+      argv[0]);
+    return 1;
   }
-  CleanupImage(&m);
+  count = atoi(argv[1]);
+  if (count <= 0) {
+    printf("Bad image count: %s\n", argv[1]);
+    return 1;
+  }
+  resolution = atoi(argv[2]);
+  if (resolution <= 0) {
+    printf("Bad image width: %s\n", argv[2]);
+    return 1;
+  }
+  SetupDevice();
+  GenerateImages(count, resolution, argv[3]);
   return 0;
 }
