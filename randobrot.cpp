@@ -390,6 +390,30 @@ static void CopyResults(MandelbrotImage *m, uint32_t *host_data) {
     hipMemcpyDeviceToHost));
 }
 
+// Fills in the IterationColorStats struct.
+static void CollectIterationStats(MandelbrotImage *m, uint32_t *host_data,
+    IterationColorStats *s) {
+  int x, y, w, h, index;
+  uint32_t tmp;
+  uint32_t min_iterations = 0xffffffff;
+  uint32_t max_iterations = 0;
+  double linear_scale = 0.0;
+  w = m->dimensions.w;
+  h = m->dimensions.h;
+  for (y = 0; y < h; y++) {
+    for (x = 0; x < w; x++) {
+      index = y * w + x;
+      tmp = host_data[index];
+      if (tmp < min_iterations) min_iterations = tmp;
+      if (tmp > max_iterations) max_iterations = tmp;
+    }
+  }
+  linear_scale = 255.0 / ((double) (max_iterations - min_iterations));
+  s->min_iterations = min_iterations;
+  s->max_iterations = max_iterations;
+  s->linear_scale = linear_scale;
+}
+
 // Converts an iteration value to r, g, and b values.
 static void IterationToColor(IterationColorStats *s, uint32_t iterations,
     uint8_t *r, uint8_t *g, uint8_t *b) {
@@ -409,25 +433,11 @@ static void GetRGBImage(MandelbrotImage *m, uint32_t *host_data,
     uint8_t *color_data) {
   IterationColorStats stats;
   int x, y, w, h, index;
-  double linear_scale = 0.0;
   uint32_t tmp;
   uint8_t r, g, b;
-  uint32_t min_iterations = 0xffffffff;
-  uint32_t max_iterations = 0;
+  CollectIterationStats(m, host_data, &stats);
   w = m->dimensions.w;
   h = m->dimensions.h;
-  for (y = 0; y < h; y++) {
-    for (x = 0; x < w; x++) {
-      index = y * w + x;
-      tmp = host_data[index];
-      if (tmp < min_iterations) min_iterations = tmp;
-      if (tmp > max_iterations) max_iterations = tmp;
-    }
-  }
-  linear_scale = 255.0 / ((double) (max_iterations - min_iterations));
-  stats.min_iterations = min_iterations;
-  stats.max_iterations = max_iterations;
-  stats.linear_scale = linear_scale;
   for (y = 0; y < h; y++) {
     for (x = 0; x < w; x++) {
       index = y * w + x;
