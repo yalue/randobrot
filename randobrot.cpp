@@ -17,6 +17,10 @@
 // The number of times each thread retries searching for a good location.
 #define RETRIES_PER_THREAD (256)
 
+// The mandelbrot escape radius. 2 is sufficient, but higher numbers result in
+// smoother coloring.
+#define ESCAPE_RADIUS (64.0)
+
 // This macro takes a hipError_t value and exits if it isn't equal to
 // hipSuccess.
 #define CheckHIPError(val) (InternalHIPErrorCheck((val), #val, __FILE__, __LINE__))
@@ -45,8 +49,6 @@ typedef struct {
   // This is the maximum number of iterations to run to see whether a point
   // escapes.
   uint32_t max_iterations;
-  // The escape radius for the mandelbrot set. Must be at least 2.
-  double escape_radius;
 } IterationControl;
 
 // This holds all data and settings for rendering a Mandelbrot set.
@@ -54,7 +56,7 @@ typedef struct {
   FractalDimensions dimensions;
   IterationControl iterations;
   // This is the data *on the device*.
-  uint32_t *data;
+  double *data;
 } MandelbrotImage;
 
 // This contains parameters and outputs used when searching for interesting
@@ -86,7 +88,7 @@ typedef struct {
   // The number of entries in the raw data buffer
   uint64_t pixel_count;
   // The original raw image data
-  uint32_t *data;
+  double *data;
   // The RGB buffer to be filled
   uint8_t *rgb_data;
 } HistogramColorData;
@@ -127,7 +129,7 @@ static void CleanupImage(MandelbrotImage *m) {
 // This returns the number of bytes needed to hold the 32-bit array of
 // iterations for each output pixel.
 static size_t GetBufferSize(MandelbrotImage *m) {
-  return m->dimensions.w * m->dimensions.h * sizeof(uint32_t);
+  return m->dimensions.w * m->dimensions.h * sizeof(double);
 }
 
 static void AllocateDeviceMemory(MandelbrotImage *m) {
@@ -157,7 +159,6 @@ static void InitializeImage(MandelbrotImage *m, int w, int h) {
   m->dimensions.max_imag = 2;
   m->iterations.min_iterations = 0;
   m->iterations.max_iterations = 100;
-  m->iterations.escape_radius = 2;
   UpdatePixelWidths(&(m->dimensions));
   AllocateDeviceMemory(m);
 }
@@ -216,22 +217,25 @@ __device__ int InOrder2Bulb(double real, double imag) {
 
 // Returns the number of iterations required for the given point to escape the
 // mandelbrot set. Returns max_iterations if the point never escapes.
-__device__ uint32_t GetMandelbrotIterations(double real, double imag,
-    uint32_t max_iterations, double escape_radius) {
+__device__ double GetMandelbrotIterations(double real, double imag,
+    uint32_t max_iterations) {
   if (InMainCardioid(real, imag)) return max_iterations;
   if (InOrder2Bulb(real, imag)) return max_iterations;
   uint32_t iteration = 0;
-  double radius_squared = escape_radius * escape_radius;
-  double start_real = real;
-  double start_imag = imag;
-  double tmp;
+  double radius_squared = ESCAPE_RADIUS * ESCAPE_RADIUS;
+  double start_real, start_imag, tmp, smooth;
+  start_real = real;
+  start_imag = imag;
   for (iteration = 0; iteration < max_iterations; iteration++) {
     if (((real * real) + (imag * imag)) >= radius_squared) break;
     tmp = (real * real) - (imag * imag) + start_real;
     imag = 2 * real * imag + start_imag;
     real = tmp;
   }
-  return iteration;
+  if (iteration >= max_iterations) return max_iterations;
+  smooth = iteration;
+  smooth += 1 - log2(log(sqrt((real * real) + (imag * imag))));
+  return smooth;
 }
 
 // Performs the random search for interesting Mandelbrot set locations. Fills
@@ -253,8 +257,7 @@ __global__ void DoRandomSearch(RandomSearchData d) {
     // plane.
     real = hiprand_uniform_double(rng) * 4.0 - 2.0;
     imag = hiprand_uniform_double(rng) * 4.0 - 2.0;
-    iterations = GetMandelbrotIterations(real, imag, max_iterations,
-      d.iterations.escape_radius);
+    iterations = GetMandelbrotIterations(real, imag, max_iterations);
     if (iterations < min_iterations) continue;
     if (iterations >= max_iterations) continue;
     // We found a point within the iteration bounds.
@@ -273,36 +276,10 @@ __global__ void DrawMandelbrot(MandelbrotImage m) {
   if (col >= m.dimensions.w) return;
   if (row >= m.dimensions.h) return;
   int index = row * m.dimensions.w + col;
-  uint32_t iteration;
-  double tmp;
-  double start_real = m.dimensions.delta_real * col + m.dimensions.min_real;
-  double start_imag = m.dimensions.delta_imag * row + m.dimensions.min_imag;
-  double current_real = start_real;
-  double current_imag = start_imag;
-  double radius_squared = m.iterations.escape_radius;
-  radius_squared *= radius_squared;
-  for (iteration = 0; iteration < m.iterations.max_iterations; iteration++) {
-    if (((current_real * current_real) + (current_imag * current_imag)) >=
-      radius_squared) {
-      break;
-    }
-    tmp = (current_real * current_real) - (current_imag * current_imag) +
-      start_real;
-    current_imag = 2 * current_real * current_imag + start_imag;
-    current_real = tmp;
-  }
-  m.data[index] = iteration;
-}
-
-// Returns the base-2 log of v, as an integer. This is equivalent to the
-// position of the highest bit in v.
-static uint32_t IntLog2(uint32_t v) {
-  uint32_t to_return = 0;
-  while (v != 0) {
-    to_return++;
-    v = v >> 1;
-  }
-  return to_return;
+  double real = m.dimensions.delta_real * col + m.dimensions.min_real;
+  double imag = m.dimensions.delta_imag * row + m.dimensions.min_imag;
+  m.data[index] = GetMandelbrotIterations(real, imag,
+    m.iterations.max_iterations);
 }
 
 // Initializes the given image struct to render a Mandelbrot image centered on
@@ -317,7 +294,6 @@ static void InitializeImageBox(MandelbrotImage *image, double real,
   // we'll get data at the spot we found randomly.
   image->iterations.max_iterations = max_iterations;
   image->iterations.min_iterations = 0;
-  image->iterations.escape_radius = 2.1;
 
   // TODO: Actually calculate a dynamic box width.
   box_width = 1.0e-12;
@@ -385,21 +361,19 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
 }
 
 // Copies image data from the device buffer to a host buffer.
-static void CopyResults(MandelbrotImage *m, uint32_t *host_data) {
+static void CopyResults(MandelbrotImage *m, double *host_data) {
   size_t byte_count = GetBufferSize(m);
   CheckHIPError(hipMemcpy(host_data, m->data, byte_count,
     hipMemcpyDeviceToHost));
 }
 
-static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
+static void GetHistogramColorData(MandelbrotImage *m, double *host_data,
     HistogramColorData *h) {
-  uint32_t max_iterations = 0;
+  uint64_t i, max_iterations, tmp;
+  double fractional_iterations;
   uint64_t pixel_count = m->dimensions.w * m->dimensions.h;
-  uint64_t *host_histogram = NULL;
-  double *host_histogram_double = NULL;
   size_t histogram_size;
-  size_t histogram_size_double;
-  uint64_t i;
+  double *host_histogram = NULL;
   // Start by initializing the non-histogram fields of h.
   memset(h, 0, sizeof(*h));
   h->data = m->data;
@@ -407,40 +381,35 @@ static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
   CheckHIPError(hipMalloc(&h->rgb_data, pixel_count * 3));
 
   // Find the maximum number of iterations, needed to allocate the histogram.
+  max_iterations = 0;
   for (i = 0; i < pixel_count; i++) {
-    if (host_data[i] > max_iterations) max_iterations = host_data[i];
+    tmp = llround(ceil(host_data[i]));
+    if (tmp > max_iterations) max_iterations = tmp;
   }
   if (max_iterations == 0) {
     // We have zero iterations, and therefore need no histogram.
     return;
   }
   h->max_iterations = max_iterations;
-  histogram_size = (max_iterations + 1) * sizeof(uint64_t);
+  histogram_size = (max_iterations + 1) * sizeof(double);
   CheckHIPError(hipHostMalloc(&host_histogram, histogram_size));
   memset(host_histogram, 0, histogram_size);
 
-  // Mext, calculate the histogram host-side.
+  // Next, calculate the histogram host-side.
   for (i = 0; i < pixel_count; i++) {
-    host_histogram[host_data[i]]++;
+    tmp = llround(floor(host_data[i]));
+    fractional_iterations = host_data[i] - ((double) tmp);
+    host_histogram[tmp] += 1;
+    host_histogram[tmp + 1] += fractional_iterations;
   }
-
-  // Pre-convert these values to doubles, to remove the need for the cast
-  // during the computationally expensive part.
-  histogram_size_double = (max_iterations + 1) * sizeof(double);
-  CheckHIPError(hipHostMalloc(&host_histogram_double, histogram_size_double));
-  for (i = 0; i <= max_iterations; i++) {
-    host_histogram_double[i] = (double) host_histogram[i];
-  }
-  CheckHIPError(hipHostFree(host_histogram));
-  host_histogram = NULL;
 
   // Finally, upload the histogram to the device.
-  CheckHIPError(hipMalloc(&h->histogram, histogram_size_double));
-  CheckHIPError(hipMemcpy(h->histogram, host_histogram_double, histogram_size,
+  CheckHIPError(hipMalloc(&h->histogram, histogram_size));
+  CheckHIPError(hipMemcpy(h->histogram, host_histogram, histogram_size,
     hipMemcpyHostToDevice));
   CheckHIPError(hipDeviceSynchronize());
-  CheckHIPError(hipHostFree(host_histogram_double));
-  host_histogram_double = NULL;
+  CheckHIPError(hipHostFree(host_histogram));
+  host_histogram = NULL;
 }
 
 // Frees the device memory associated with h, except for the raw image data,
@@ -455,7 +424,8 @@ static void CleanupHistogramColorData(HistogramColorData *h) {
 __global__ void ConvertIterationsToRGB(HistogramColorData h) {
   uint64_t index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
   uint64_t rgb_start;
-  uint32_t i, iterations;
+  uint64_t i;
+  double iterations;
   double v = 0.0;
   double total;
   uint8_t gray_value;
@@ -466,6 +436,8 @@ __global__ void ConvertIterationsToRGB(HistogramColorData h) {
   for (i = 0; i <= iterations; i++) {
     v += h.histogram[i] / total;
   }
+  // Add a value for the fractional iterations
+  v += (h.histogram[i + 1] * (iterations - i)) / total;
   v *= 255;
   if (v > 255) v = 255;
   if (v < 0) v = 0;
@@ -476,7 +448,7 @@ __global__ void ConvertIterationsToRGB(HistogramColorData h) {
 }
 
 // Converts host data to color image data for writing to a PPM image.
-static void GetRGBImage(MandelbrotImage *m, uint32_t *host_data,
+static void GetRGBImage(MandelbrotImage *m, double *host_data,
     uint8_t *color_data) {
   uint64_t pixel_count;
   uint32_t block_count;
@@ -501,7 +473,7 @@ static int SaveImage(MandelbrotImage *m, const char *filename) {
   FILE *f = NULL;
   uint8_t *color_data = NULL;
   size_t color_data_size = 0;
-  uint32_t *host_data = NULL;
+  double *host_data = NULL;
 
   // First, copy the raw output buffer to the host.
   CheckHIPError(hipHostMalloc(&host_data, GetBufferSize(m)));
@@ -576,7 +548,6 @@ static void GenerateImages(int count, int width, const char *dir) {
   memset(&iterations, 0, sizeof(iterations));
   iterations.max_iterations = 40000;
   iterations.min_iterations = 10000;
-  iterations.escape_radius = 4.0;
   images = (MandelbrotImage *) malloc(count * sizeof(MandelbrotImage));
   if (!images) {
     printf("Failed allocating list of Mandelbrot images.\n");
