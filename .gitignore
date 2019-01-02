@@ -1,3 +1,4 @@
 *.ppm
 *.png
 randobrot
+output/image_parameters.txt

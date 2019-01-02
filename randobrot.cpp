@@ -82,10 +82,7 @@ typedef struct {
   // The number of entries in the histogram
   uint32_t max_iterations;
   // The histogram mapping iteration -> # of pixels with that iteration.
-  uint64_t *histogram;
-  // This should be equal to pixel_count, but wikipedia counts it separately.
-  // Am I missing something here?
-  double total;
+  double *histogram;
   // The number of entries in the raw data buffer
   uint64_t pixel_count;
   // The original raw image data
@@ -110,6 +107,16 @@ static uint64_t GetRNGSeed(void) {
   to_return = t.tv_nsec;
   to_return += t.tv_sec * 1e9;
   return to_return;
+}
+
+// Fills the buffer with random lowercase alphanumeric characters. Places a
+// null character at the end of the buffer.
+static void GetRandomString(char *buffer, int buffer_size) {
+  int i;
+  for (i = 0; i < (buffer_size - 1); i++) {
+    buffer[i] = 'a' + (rand() % 26);
+  }
+  buffer[buffer_size - 1] = 0;
 }
 
 static void CleanupImage(MandelbrotImage *m) {
@@ -389,7 +396,9 @@ static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
   uint32_t max_iterations = 0;
   uint64_t pixel_count = m->dimensions.w * m->dimensions.h;
   uint64_t *host_histogram = NULL;
+  double *host_histogram_double = NULL;
   size_t histogram_size;
+  size_t histogram_size_double;
   uint64_t i;
   // Start by initializing the non-histogram fields of h.
   memset(h, 0, sizeof(*h));
@@ -410,21 +419,28 @@ static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
   CheckHIPError(hipHostMalloc(&host_histogram, histogram_size));
   memset(host_histogram, 0, histogram_size);
 
-  // Mext, calculate the histogram host-side and upload it to the device.
+  // Mext, calculate the histogram host-side.
   for (i = 0; i < pixel_count; i++) {
     host_histogram[host_data[i]]++;
   }
+
+  // Pre-convert these values to doubles, to remove the need for the cast
+  // during the computationally expensive part.
+  histogram_size_double = (max_iterations + 1) * sizeof(double);
+  CheckHIPError(hipHostMalloc(&host_histogram_double, histogram_size_double));
   for (i = 0; i <= max_iterations; i++) {
-    h->total += host_histogram[i];
+    host_histogram_double[i] = (double) host_histogram[i];
   }
-  /////////////////////////////////////////////////////////////////// DEBUG
-  printf("Total: %f, pixel count: %llu\n", h->total, (unsigned long long) pixel_count);
-  CheckHIPError(hipMalloc(&h->histogram, histogram_size));
-  CheckHIPError(hipMemcpy(h->histogram, host_histogram, histogram_size,
-    hipMemcpyHostToDevice));
-  CheckHIPError(hipDeviceSynchronize());
   CheckHIPError(hipHostFree(host_histogram));
   host_histogram = NULL;
+
+  // Finally, upload the histogram to the device.
+  CheckHIPError(hipMalloc(&h->histogram, histogram_size_double));
+  CheckHIPError(hipMemcpy(h->histogram, host_histogram_double, histogram_size,
+    hipMemcpyHostToDevice));
+  CheckHIPError(hipDeviceSynchronize());
+  CheckHIPError(hipHostFree(host_histogram_double));
+  host_histogram_double = NULL;
 }
 
 // Frees the device memory associated with h, except for the raw image data,
@@ -441,12 +457,14 @@ __global__ void ConvertIterationsToRGB(HistogramColorData h) {
   uint64_t rgb_start;
   uint32_t i, iterations;
   double v = 0.0;
+  double total;
   uint8_t gray_value;
   if (index > h.pixel_count) return;
+  total = (double) h.pixel_count;
   iterations = h.data[index];
   rgb_start = index * 3;
   for (i = 0; i <= iterations; i++) {
-    v += ((double) h.histogram[i]) / h.total;
+    v += h.histogram[i] / total;
   }
   v *= 255;
   if (v > 255) v = 255;
@@ -532,9 +550,25 @@ static int SaveImage(MandelbrotImage *m, const char *filename) {
   return 1;
 }
 
+// Appends a line about the given Mandelbrot image to the given log file, so
+// that the parameters for the given image name can be found if desired.
+// Returns 0 on error.
+static int AppendMetadataToLog(MandelbrotImage *m, char *name, FILE *f) {
+  FractalDimensions dims = m->dimensions;
+  if (fprintf(f, "%s: Bounds = %.14f+%.14fi to %.14f+%.14fi. "
+    "Max iterations: %u.\n", name, dims.min_real, dims.min_imag, dims.max_real,
+    dims.max_imag, m->iterations.max_iterations) <= 0) {
+    printf("Failed writing image info to log file: %s\n", strerror(errno));
+    return 0;
+  }
+  return 1;
+}
+
 static void GenerateImages(int count, int width, const char *dir) {
   int number_found, i;
   char image_filename[1024];
+  char random_name[16];
+  FILE *info_log = NULL;
   MandelbrotImage *images = NULL;
   IterationControl iterations;
   dim3 block_dim(16, 16);
@@ -554,9 +588,18 @@ static void GenerateImages(int count, int width, const char *dir) {
     free(images);
     return;
   }
+  snprintf(image_filename, sizeof(image_filename), "%s/image_parameters.txt",
+    dir);
+  info_log = fopen(image_filename, "ab");
+  if (!info_log) {
+    printf("Failed opening info log %s: %s. Continuing without logging.\n",
+      image_filename, strerror(errno));
+  }
   for (i = 0; i < number_found; i++) {
     memset(image_filename, 0, sizeof(image_filename));
-    snprintf(image_filename, sizeof(image_filename), "%s/%d.ppm", dir, i + 1);
+    GetRandomString(random_name, sizeof(random_name));
+    snprintf(image_filename, sizeof(image_filename), "%s/%d_%s.ppm", dir,
+      i + 1, random_name);
     printf("Rendering image %d of %d...\n", i + 1, number_found);
     hipLaunchKernelGGL(DrawMandelbrot, grid_dim, block_dim, 0, 0, images[i]);
     CheckHIPError(hipDeviceSynchronize());
@@ -565,8 +608,11 @@ static void GenerateImages(int count, int width, const char *dir) {
     } else {
       printf("Image saved as %s\n", image_filename);
     }
+    if (info_log) AppendMetadataToLog(images + i, image_filename, info_log);
     CleanupImage(images + i);
   }
+  if (info_log) fclose(info_log);
+  info_log = NULL;
   free(images);
   images = NULL;
 }
@@ -585,6 +631,7 @@ static void SetupDevice(void) {
 
 int main(int argc, char **argv) {
   int count, resolution;
+  srand(GetRNGSeed());
   MandelbrotImage m;
   if (argc != 4) {
     printf("Usage: %s <max # of images> <image width> <output directory>\n",
