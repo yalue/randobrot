@@ -57,17 +57,6 @@ typedef struct {
   uint32_t *data;
 } MandelbrotImage;
 
-// This holds data required for coloring a pixel based on iterations.
-typedef struct {
-  // The minimum observed iterations in the canvas
-  uint32_t min_iterations;
-  // The maximum observed iterations in the canvas
-  uint32_t max_iterations;
-  // A scale to multiply the iterations by to obtain a linear color gradient.
-  // TODO: remove when better coloring is possible.
-  double linear_scale;
-} IterationColorStats;
-
 // This contains parameters and outputs used when searching for interesting
 // locations.
 typedef struct {
@@ -87,6 +76,20 @@ typedef struct {
   uint32_t *iterations_needed;
   IterationControl iterations;
 } RandomSearchData;
+
+// This holds device-side data for coloring an image.
+typedef struct {
+  // The number of entries in the histogram
+  uint32_t max_iterations;
+  // The histogram mapping iteration -> # of pixels with that iteration.
+  uint64_t *histogram;
+  // The number of entries in the raw data buffer
+  uint64_t pixel_count;
+  // The original raw image data
+  uint32_t *data;
+  // The RGB buffer to be filled
+  uint8_t *rgb_data;
+} HistogramColorData;
 
 static void InternalHIPErrorCheck(hipError_t result, const char *fn,
     const char *file, int line) {
@@ -176,10 +179,10 @@ static void InitializeRandomSearchData(RandomSearchData *d,
 
 // Frees all of the memory in the RandomSearchData struct.
 static void CleanupRandomSearchData(RandomSearchData *d) {
-  CheckHIPError(hipFree(d->rng_states));
-  CheckHIPError(hipFree(d->real_locations));
-  CheckHIPError(hipFree(d->imag_locations));
-  CheckHIPError(hipFree(d->iterations_needed));
+  if (d->rng_states) CheckHIPError(hipFree(d->rng_states));
+  if (d->real_locations) CheckHIPError(hipFree(d->real_locations));
+  if (d->imag_locations) CheckHIPError(hipFree(d->imag_locations));
+  if (d->iterations_needed) CheckHIPError(hipFree(d->iterations_needed));
   memset(d, 0, sizeof(*d));
 }
 
@@ -372,6 +375,9 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
   // max_images to something higher than SEARCH_THREAD_COUNT).
   for (i = 0; i < SEARCH_THREAD_COUNT; i++) {
     if (host_iterations[i] == 0) continue;
+    if (host_iterations[i] > iterations->max_iterations) continue;
+    if ((host_real[i] < -2) || (host_real[i] > 2)) continue;
+    if ((host_imag[i] < -2) || (host_imag[i] > 2)) continue;
     InitializeImageBox(images + images_found, host_real[i], host_imag[i],
       host_iterations[i], width);
     images_found++;
@@ -390,64 +396,96 @@ static void CopyResults(MandelbrotImage *m, uint32_t *host_data) {
     hipMemcpyDeviceToHost));
 }
 
-// Fills in the IterationColorStats struct.
-static void CollectIterationStats(MandelbrotImage *m, uint32_t *host_data,
-    IterationColorStats *s) {
-  int x, y, w, h, index;
-  uint32_t tmp;
-  uint32_t min_iterations = 0xffffffff;
+static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
+    HistogramColorData *h) {
   uint32_t max_iterations = 0;
-  double linear_scale = 0.0;
-  w = m->dimensions.w;
-  h = m->dimensions.h;
-  for (y = 0; y < h; y++) {
-    for (x = 0; x < w; x++) {
-      index = y * w + x;
-      tmp = host_data[index];
-      if (tmp < min_iterations) min_iterations = tmp;
-      if (tmp > max_iterations) max_iterations = tmp;
-    }
+  uint64_t pixel_count = m->dimensions.w * m->dimensions.h;
+  uint64_t *host_histogram = NULL;
+  size_t histogram_size;
+  uint64_t i;
+  // Start by initializing the non-histogram fields of h.
+  memset(h, 0, sizeof(*h));
+  h->data = m->data;
+  h->pixel_count = pixel_count;
+  CheckHIPError(hipMalloc(&h->rgb_data, pixel_count * 3));
+
+  // Find the maximum number of iterations, needed to allocate the histogram.
+  for (i = 0; i < pixel_count; i++) {
+    if (host_data[i] > max_iterations) max_iterations = host_data[i];
   }
-  linear_scale = 255.0 / ((double) (max_iterations - min_iterations));
-  s->min_iterations = min_iterations;
-  s->max_iterations = max_iterations;
-  s->linear_scale = linear_scale;
+  if (max_iterations == 0) {
+    // We have zero iterations, and therefore need to histogram.
+    return;
+  }
+  h->max_iterations = max_iterations;
+  histogram_size = max_iterations * sizeof(uint64_t);
+  host_histogram = (uint64_t *) malloc(histogram_size);
+  if (!host_histogram) {
+    printf("Failed allocating host-side histogram.\n");
+    hipFree(h->rgb_data);
+    memset(h, 0, sizeof(*h));
+    return;
+  }
+  memset(host_histogram, 0, histogram_size);
+
+  // Mext, calculate the histogram host-side and upload it to the device.
+  for (i = 0; i < pixel_count; i++) {
+    host_histogram[host_data[i]]++;
+  }
+  CheckHIPError(hipMalloc(&h->histogram, histogram_size));
+  CheckHIPError(hipMemcpy(h->histogram, host_histogram, histogram_size,
+    hipMemcpyHostToDevice));
+  CheckHIPError(hipDeviceSynchronize());
+  free(host_histogram);
+  host_histogram = NULL;
 }
 
-// Converts an iteration value to r, g, and b values.
-static void IterationToColor(IterationColorStats *s, uint32_t iterations,
-    uint8_t *r, uint8_t *g, uint8_t *b) {
-  double v = (double) (iterations - s->min_iterations);
-  int gray_value;
-  v *= s->linear_scale;
-  gray_value = (int) v;
-  if (v < 0) v = 0;
+// Frees the device memory associated with h, except for the raw image data,
+// which should be cleaned up when the associated MandelbrotImage is cleaned
+// up.
+static void CleanupHistogramColorData(HistogramColorData *h) {
+  if (h->histogram) CheckHIPError(hipFree(h->histogram));
+  if (h->rgb_data) CheckHIPError(hipFree(h->rgb_data));
+  memset(h, 0, sizeof(*h));
+}
+
+__global__ void ConvertIterationsToRGB(HistogramColorData h) {
+  uint64_t index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+  uint64_t rgb_start;
+  uint32_t i, iterations;
+  double v = 0.0;
+  uint8_t gray_value;
+  if (index > h.pixel_count) return;
+  iterations = h.data[index];
+  rgb_start = index * 3;
+  for (i = 0; i < iterations; i++) {
+    v += ((double) h.histogram[i]) / ((double) h.pixel_count);
+  }
+  v *= 255;
   if (v > 255) v = 255;
-  *r = v;
-  *g = v;
-  *b = v;
+  if (v < 0) v = 0;
+  gray_value = v;
+  h.rgb_data[rgb_start] = v;
+  h.rgb_data[rgb_start + 1] = v;
+  h.rgb_data[rgb_start + 2] = v;
 }
 
 // Converts host data to color image data for writing to a PPM image.
 static void GetRGBImage(MandelbrotImage *m, uint32_t *host_data,
     uint8_t *color_data) {
-  IterationColorStats stats;
-  int x, y, w, h, index;
-  uint32_t tmp;
-  uint8_t r, g, b;
-  CollectIterationStats(m, host_data, &stats);
-  w = m->dimensions.w;
-  h = m->dimensions.h;
-  for (y = 0; y < h; y++) {
-    for (x = 0; x < w; x++) {
-      index = y * w + x;
-      tmp = host_data[index];
-      IterationToColor(&stats, tmp, &r, &g, &b);
-      color_data[index * 3] = r;
-      color_data[index * 3 + 1] = g;
-      color_data[index * 3 + 2] = b;
-    }
-  }
+  uint64_t pixel_count;
+  uint32_t block_count;
+  HistogramColorData histogram_data;
+  GetHistogramColorData(m, host_data, &histogram_data);
+  pixel_count = histogram_data.pixel_count;
+  block_count = pixel_count / 256;
+  if ((block_count % 256) != 0) block_count++;
+  hipLaunchKernelGGL(ConvertIterationsToRGB, block_count, 256, 0, 0,
+    histogram_data);
+  CheckHIPError(hipDeviceSynchronize());
+  CheckHIPError(hipMemcpy(color_data, histogram_data.rgb_data, pixel_count * 3,
+    hipMemcpyDeviceToHost));
+  CleanupHistogramColorData(&histogram_data);
 }
 
 // Saves a ppm-format file to the given filename. Returns 0 on error and
