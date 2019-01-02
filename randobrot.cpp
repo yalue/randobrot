@@ -311,8 +311,8 @@ static void InitializeImageBox(MandelbrotImage *image, double real,
 
   // TODO: Actually calculate a dynamic box width.
   box_width = 1.0e-8;
-  printf("Location at %f+%fi with %u iterations has box width %f\n",
-    real, imag, (unsigned) max_iterations, box_width);
+  printf("Location at %f+%fi with %u iterations\n", real, imag,
+    (unsigned) max_iterations);
   image->dimensions.min_real = real - box_width / 2;
   image->dimensions.max_real = real + box_width / 2;
   image->dimensions.min_imag = imag - box_width / 2;
@@ -343,29 +343,14 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
 
   // Next, copy the found image locations to the host.
   copy_size = SEARCH_THREAD_COUNT * sizeof(double);
-  host_real = (double *) malloc(copy_size);
-  if (!host_real) {
-    printf("Failed allocating buffer for host real values.\n");
-    return 0;
-  }
+  CheckHIPError(hipHostMalloc(&host_real, copy_size));
   CheckHIPError(hipMemcpy(host_real, d.real_locations, copy_size,
     hipMemcpyDeviceToHost));
-  host_imag = (double *) malloc(copy_size);
-  if (!host_imag) {
-    printf("Failed allocating buffer for host imaginary values.\n");
-    free(host_real);
-    return 0;
-  }
+  CheckHIPError(hipHostMalloc(&host_imag, copy_size));
   CheckHIPError(hipMemcpy(host_imag, d.imag_locations, copy_size,
     hipMemcpyDeviceToHost));
   copy_size = SEARCH_THREAD_COUNT * sizeof(uint32_t);
-  host_iterations = (uint32_t *) malloc(copy_size);
-  if (!host_iterations) {
-    printf("Failed allocating buffer for host iteration counts.\n");
-    free(host_real);
-    free(host_imag);
-    return 0;
-  }
+  CheckHIPError(hipHostMalloc(&host_iterations, copy_size));
   CheckHIPError(hipMemcpy(host_iterations, d.iterations_needed, copy_size,
     hipMemcpyDeviceToHost));
   CleanupRandomSearchData(&d);
@@ -383,9 +368,9 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
     images_found++;
     if (images_found >= max_images) break;
   }
-  free(host_real);
-  free(host_imag);
-  free(host_iterations);
+  CheckHIPError(hipHostFree(host_real));
+  CheckHIPError(hipHostFree(host_imag));
+  CheckHIPError(hipHostFree(host_iterations));
   return images_found;
 }
 
@@ -419,13 +404,7 @@ static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
   }
   h->max_iterations = max_iterations;
   histogram_size = max_iterations * sizeof(uint64_t);
-  host_histogram = (uint64_t *) malloc(histogram_size);
-  if (!host_histogram) {
-    printf("Failed allocating host-side histogram.\n");
-    hipFree(h->rgb_data);
-    memset(h, 0, sizeof(*h));
-    return;
-  }
+  CheckHIPError(hipHostMalloc(&host_histogram, histogram_size));
   memset(host_histogram, 0, histogram_size);
 
   // Mext, calculate the histogram host-side and upload it to the device.
@@ -436,7 +415,7 @@ static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
   CheckHIPError(hipMemcpy(h->histogram, host_histogram, histogram_size,
     hipMemcpyHostToDevice));
   CheckHIPError(hipDeviceSynchronize());
-  free(host_histogram);
+  CheckHIPError(hipHostFree(host_histogram));
   host_histogram = NULL;
 }
 
@@ -485,6 +464,7 @@ static void GetRGBImage(MandelbrotImage *m, uint32_t *host_data,
   CheckHIPError(hipDeviceSynchronize());
   CheckHIPError(hipMemcpy(color_data, histogram_data.rgb_data, pixel_count * 3,
     hipMemcpyDeviceToHost));
+  CheckHIPError(hipDeviceSynchronize());
   CleanupHistogramColorData(&histogram_data);
 }
 
@@ -495,32 +475,25 @@ static int SaveImage(MandelbrotImage *m, const char *filename) {
   FILE *f = NULL;
   uint8_t *color_data = NULL;
   size_t color_data_size = 0;
+  uint32_t *host_data = NULL;
 
   // First, copy the raw output buffer to the host.
-  uint32_t *host_data = (uint32_t *) malloc(GetBufferSize(m));
-  if (!host_data) {
-    printf("Failed allocating buffer for host image.\n");
-    return 0;
-  }
+  CheckHIPError(hipHostMalloc(&host_data, GetBufferSize(m)));
   CopyResults(m, host_data);
 
   // Next, convert the raw buffer to RGB pixel data. We need 3 bytes per pixel
   // here.
   color_data_size = dims.w * dims.h * 3;
-  color_data = (uint8_t *) malloc(color_data_size);
-  if (!color_data) {
-    printf("Failed allocating buffer for color image.\n");
-    return 0;
-  }
+  CheckHIPError(hipHostMalloc(&color_data, color_data_size));
   GetRGBImage(m, host_data, color_data);
-  free(host_data);
+  CheckHIPError(hipHostFree(host_data));
   host_data = NULL;
 
   // Next, create the output file and write the data to it.
   f = fopen(filename, "wb");
   if (!f) {
     printf("Failed opening output file: %s\n", strerror(errno));
-    free(color_data);
+    hipHostFree(color_data);
     return 0;
   }
   // Include the parameters for the set as a "comment" in the image.
@@ -529,13 +502,13 @@ static int SaveImage(MandelbrotImage *m, const char *filename) {
     (unsigned) m->iterations.max_iterations) <= 0) {
     printf("Failed writing Mandelbrot metadata: %s\n", strerror(errno));
     fclose(f);
-    free(color_data);
+    hipHostFree(color_data);
     return 0;
   }
   if (fprintf(f, "%d %d\n255\n", dims.w, dims.h) <= 0) {
     printf("Failed writing ppm header: %s\n", strerror(errno));
     fclose(f);
-    free(color_data);
+    hipHostFree(color_data);
     return 0;
   }
 
@@ -543,10 +516,11 @@ static int SaveImage(MandelbrotImage *m, const char *filename) {
     printf("Failed writing pixel data: %s\n", strerror(errno));
     fclose(f);
     free(color_data);
+    hipHostFree(color_data);
     return 0;
   }
   fclose(f);
-  free(color_data);
+  CheckHIPError(hipHostFree(color_data));
   return 1;
 }
 
@@ -574,8 +548,8 @@ static void GenerateImages(int count, int width, const char *dir) {
   }
   for (i = 0; i < number_found; i++) {
     memset(image_filename, 0, sizeof(image_filename));
-    snprintf(image_filename, sizeof(image_filename), "%s/%d.ppm", dir, i);
-    printf("Rendering image %d of %d...\n", i, number_found);
+    snprintf(image_filename, sizeof(image_filename), "%s/%d.ppm", dir, i + 1);
+    printf("Rendering image %d of %d...\n", i + 1, number_found);
     hipLaunchKernelGGL(DrawMandelbrot, grid_dim, block_dim, 0, 0, images[i]);
     CheckHIPError(hipDeviceSynchronize());
     if (!SaveImage(images + i, image_filename)) {
