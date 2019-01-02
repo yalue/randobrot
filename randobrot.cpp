@@ -12,10 +12,10 @@
 #define DEVICE_ID (0)
 
 // The number of GPU threads to use when searching for interesting locations.
-#define SEARCH_THREAD_COUNT (2048)
+#define SEARCH_THREAD_COUNT (1024 * 32)
 
 // The number of times each thread retries searching for a good location.
-#define RETRIES_PER_THREAD (512)
+#define RETRIES_PER_THREAD (256)
 
 // This macro takes a hipError_t value and exits if it isn't equal to
 // hipSuccess.
@@ -83,6 +83,9 @@ typedef struct {
   uint32_t max_iterations;
   // The histogram mapping iteration -> # of pixels with that iteration.
   uint64_t *histogram;
+  // This should be equal to pixel_count, but wikipedia counts it separately.
+  // Am I missing something here?
+  double total;
   // The number of entries in the raw data buffer
   uint64_t pixel_count;
   // The original raw image data
@@ -310,7 +313,7 @@ static void InitializeImageBox(MandelbrotImage *image, double real,
   image->iterations.escape_radius = 2.1;
 
   // TODO: Actually calculate a dynamic box width.
-  box_width = 1.0e-8;
+  box_width = 1.0e-12;
   printf("Location at %f+%fi with %u iterations\n", real, imag,
     (unsigned) max_iterations);
   image->dimensions.min_real = real - box_width / 2;
@@ -399,11 +402,11 @@ static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
     if (host_data[i] > max_iterations) max_iterations = host_data[i];
   }
   if (max_iterations == 0) {
-    // We have zero iterations, and therefore need to histogram.
+    // We have zero iterations, and therefore need no histogram.
     return;
   }
   h->max_iterations = max_iterations;
-  histogram_size = max_iterations * sizeof(uint64_t);
+  histogram_size = (max_iterations + 1) * sizeof(uint64_t);
   CheckHIPError(hipHostMalloc(&host_histogram, histogram_size));
   memset(host_histogram, 0, histogram_size);
 
@@ -411,6 +414,11 @@ static void GetHistogramColorData(MandelbrotImage *m, uint32_t *host_data,
   for (i = 0; i < pixel_count; i++) {
     host_histogram[host_data[i]]++;
   }
+  for (i = 0; i <= max_iterations; i++) {
+    h->total += host_histogram[i];
+  }
+  /////////////////////////////////////////////////////////////////// DEBUG
+  printf("Total: %f, pixel count: %llu\n", h->total, (unsigned long long) pixel_count);
   CheckHIPError(hipMalloc(&h->histogram, histogram_size));
   CheckHIPError(hipMemcpy(h->histogram, host_histogram, histogram_size,
     hipMemcpyHostToDevice));
@@ -437,8 +445,8 @@ __global__ void ConvertIterationsToRGB(HistogramColorData h) {
   if (index > h.pixel_count) return;
   iterations = h.data[index];
   rgb_start = index * 3;
-  for (i = 0; i < iterations; i++) {
-    v += ((double) h.histogram[i]) / ((double) h.pixel_count);
+  for (i = 0; i <= iterations; i++) {
+    v += ((double) h.histogram[i]) / h.total;
   }
   v *= 255;
   if (v > 255) v = 255;
