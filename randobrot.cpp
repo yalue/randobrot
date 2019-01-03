@@ -428,7 +428,7 @@ __global__ void ConvertIterationsToRGB(HistogramColorData h) {
   double iterations;
   double v = 0.0;
   double total;
-  uint8_t gray_value;
+  uint32_t gray_value;
   if (index > h.pixel_count) return;
   total = (double) h.pixel_count;
   iterations = h.data[index];
@@ -439,12 +439,12 @@ __global__ void ConvertIterationsToRGB(HistogramColorData h) {
   // Add a value for the fractional iterations
   v += (h.histogram[i + 1] * (iterations - i)) / total;
   v *= 255;
-  if (v > 255) v = 255;
-  if (v < 0) v = 0;
-  gray_value = v;
-  h.rgb_data[rgb_start] = v;
-  h.rgb_data[rgb_start + 1] = v;
-  h.rgb_data[rgb_start + 2] = v;
+  gray_value = lround(v);
+  if (gray_value > 255) gray_value = 255;
+  if (gray_value < 0) gray_value = 0;
+  h.rgb_data[rgb_start] = gray_value;
+  h.rgb_data[rgb_start + 1] = gray_value;
+  h.rgb_data[rgb_start + 2] = gray_value;
 }
 
 // Converts host data to color image data for writing to a PPM image.
@@ -603,7 +603,6 @@ static void SetupDevice(void) {
 int main(int argc, char **argv) {
   int count, resolution;
   srand(GetRNGSeed());
-  MandelbrotImage m;
   if (argc != 4) {
     printf("Usage: %s <max # of images> <image width> <output directory>\n",
       argv[0]);
