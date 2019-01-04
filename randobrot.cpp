@@ -21,9 +21,18 @@
 // smoother coloring.
 #define ESCAPE_RADIUS (64.0)
 
+// This determines the amount of supersamples to use when drawing the set. For
+// example, if this is 3, then each pixel in the output image will be
+// determined by the average iteration of a 3x3 box centered on the original
+// complex point.
+#define SUPERSAMPLING_AMOUNT (2)
+
 // This macro takes a hipError_t value and exits if it isn't equal to
 // hipSuccess.
 #define CheckHIPError(val) (InternalHIPErrorCheck((val), #val, __FILE__, __LINE__))
+
+// Keep around a global RNG seed to enable reproducable runs.
+uint64_t global_rng_seed = 0;
 
 // This defines the boundaries and locations of a "canvas" for drawing a
 // complex-plane fractal.
@@ -268,18 +277,47 @@ __global__ void DoRandomSearch(RandomSearchData d) {
   }
 }
 
+__device__ double Average(double *array, int count) {
+  double total = 0.0;
+  int i;
+  for (i = 0; i < count; i++) {
+    total += array[i];
+  }
+  return total / (double) count;
+}
+
 // This uses a 2-D grid of threads. The x and y dimensions must cover the
 // entire width of the output image.
 __global__ void DrawMandelbrot(MandelbrotImage m) {
-  int col = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
-  int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
+  int x, y, col, row, index;
+  double start_real, real, imag, actual_dx, actual_dy;
+  double supersamples[SUPERSAMPLING_AMOUNT * SUPERSAMPLING_AMOUNT];
+  int sample_count = SUPERSAMPLING_AMOUNT * SUPERSAMPLING_AMOUNT;
+  col = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+  row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (col >= m.dimensions.w) return;
   if (row >= m.dimensions.h) return;
-  int index = row * m.dimensions.w + col;
-  double real = m.dimensions.delta_real * col + m.dimensions.min_real;
-  double imag = m.dimensions.delta_imag * row + m.dimensions.min_imag;
-  m.data[index] = GetMandelbrotIterations(real, imag,
-    m.iterations.max_iterations);
+  actual_dx = m.dimensions.delta_real / SUPERSAMPLING_AMOUNT;
+  actual_dy = m.dimensions.delta_imag / SUPERSAMPLING_AMOUNT;
+  real = m.dimensions.delta_real * col + m.dimensions.min_real;
+  imag = m.dimensions.delta_imag * row + m.dimensions.min_imag;
+  // Offset the start real and imaginary coordinates to center the samples on
+  // the original point.
+  real -= actual_dx * ((double) SUPERSAMPLING_AMOUNT / 2.0);
+  imag -= actual_dy * ((double) SUPERSAMPLING_AMOUNT / 2.0);
+  start_real = real;
+  for (y = 0; y < SUPERSAMPLING_AMOUNT; y++) {
+    for (x = 0; x < SUPERSAMPLING_AMOUNT; x++) {
+      index = y * SUPERSAMPLING_AMOUNT + x;
+      supersamples[index] = GetMandelbrotIterations(real, imag,
+        m.iterations.max_iterations);
+      real += actual_dx;
+    }
+    imag += actual_dy;
+    real = start_real;
+  }
+  index = row * m.dimensions.w + col;
+  m.data[index] = Average(supersamples, sample_count);
 }
 
 // Initializes the given image struct to render a Mandelbrot image centered on
@@ -601,8 +639,7 @@ static void SetupDevice(void) {
 }
 
 int main(int argc, char **argv) {
-  int count, resolution;
-  srand(GetRNGSeed());
+  int count, resolution, rng_seed;
   if (argc != 4) {
     printf("Usage: %s <max # of images> <image width> <output directory>\n",
       argv[0]);
@@ -618,6 +655,7 @@ int main(int argc, char **argv) {
     printf("Bad image width: %s\n", argv[2]);
     return 1;
   }
+  srand(GetRNGSeed());
   SetupDevice();
   GenerateImages(count, resolution, argv[3]);
   return 0;
