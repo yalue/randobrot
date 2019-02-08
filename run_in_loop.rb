@@ -1,3 +1,7 @@
+# This script is mean to generate large numbers of images (around 100000, with
+# the current setting of 100 loops), while converting the resulting images to
+# png in order to not waste as much disk space when doing so.
+
 def count_images()
   `cd ./output/ && ls *.png | wc -l`.to_i
 end

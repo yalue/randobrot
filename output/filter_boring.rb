@@ -1,3 +1,6 @@
+# This uses chunky_png to detect mostly-white or mostly-black images and move
+# them elsewhere (typically to be deleted). For this to work, the images must
+# have already been converted to PNGs, such as by running convert_all.rb.
 require 'chunky_png'
 
 def get_brightness(c)
