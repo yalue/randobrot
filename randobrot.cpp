@@ -5,8 +5,7 @@
 #include <string.h>
 #include <time.h>
 #include <hip/hip_runtime.h>
-#include <hiprand/hiprand.h>
-#include <hiprand/hiprand_kernel.h>
+#include "hip_rng.h"
 
 // The device number on which to perform the computation.
 #define DEVICE_ID (0)
@@ -30,9 +29,6 @@
 // This macro takes a hipError_t value and exits if it isn't equal to
 // hipSuccess.
 #define CheckHIPError(val) (InternalHIPErrorCheck((val), #val, __FILE__, __LINE__))
-
-// Keep around a global RNG seed to enable reproducable runs.
-uint64_t global_rng_seed = 0;
 
 // This defines the boundaries and locations of a "canvas" for drawing a
 // complex-plane fractal.
@@ -73,7 +69,7 @@ typedef struct {
 typedef struct {
   // A list of RNG states for the search. There must be one such state per
   // search thread.
-  hiprandState_t *rng_states;
+  RNGState *rng_states;
   // A list of real locations, 1 per thread, containing the interesting point.
   // This will be less than -2 if the associated thread did not find an
   // interesting point.
@@ -117,6 +113,15 @@ static uint64_t GetRNGSeed(void) {
   clock_gettime(CLOCK_REALTIME, &t);
   to_return = t.tv_nsec;
   to_return += t.tv_sec * 1e9;
+  return to_return;
+}
+
+static double GetTimeSeconds(void) {
+  double to_return = 0;
+  struct timespec t;
+  clock_gettime(CLOCK_REALTIME, &t);
+  to_return = t.tv_sec;
+  to_return += t.tv_nsec * 1e-9;
   return to_return;
 }
 
@@ -172,10 +177,10 @@ static void InitializeImage(MandelbrotImage *m, int w, int h) {
   AllocateDeviceMemory(m);
 }
 
-__global__ void InitializeRNG(uint64_t seed, hiprandState_t *states) {
+__global__ void InitializeRNG(uint64_t seed, RNGState *states) {
   int index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
   if (index > SEARCH_THREAD_COUNT) return;
-  hiprand_init(seed, index, 0, states + index);
+  InitRNGState(seed, index, states + index);
 }
 
 // Initializes the GPU memory and RNG states for the random search.
@@ -184,7 +189,7 @@ static void InitializeRandomSearchData(RandomSearchData *d,
   int count = SEARCH_THREAD_COUNT;
   int block_count = count / 256;
   if ((count % 256) != 0) block_count++;
-  CheckHIPError(hipMalloc(&(d->rng_states), count * sizeof(hiprandState_t)));
+  CheckHIPError(hipMalloc(&(d->rng_states), count * sizeof(RNGState)));
   CheckHIPError(hipMalloc(&(d->real_locations), count * sizeof(double)));
   CheckHIPError(hipMemset(d->real_locations, 0, count * sizeof(double)));
   CheckHIPError(hipMalloc(&(d->imag_locations), count * sizeof(double)));
@@ -256,7 +261,7 @@ __global__ void DoRandomSearch(RandomSearchData d) {
   uint32_t min_iterations = d.iterations.min_iterations;
   uint32_t max_iterations = d.iterations.max_iterations;
   int index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
-  hiprandState_t *rng = d.rng_states + index;
+  RNGState *rng = d.rng_states + index;
   if (index > SEARCH_THREAD_COUNT) return;
   d.iterations_needed[index] = 0;
   d.real_locations[index] = -3;
@@ -264,8 +269,8 @@ __global__ void DoRandomSearch(RandomSearchData d) {
   for (try_number = 0; try_number < RETRIES_PER_THREAD; try_number++) {
     // Get a random point within the 4x4 area at the center of the complex
     // plane.
-    real = hiprand_uniform_double(rng) * 4.0 - 2.0;
-    imag = hiprand_uniform_double(rng) * 4.0 - 2.0;
+    real = UniformDouble(rng) * 4.0 - 2.0;
+    imag = UniformDouble(rng) * 4.0 - 2.0;
     iterations = GetMandelbrotIterations(real, imag, max_iterations);
     if (iterations < min_iterations) continue;
     if (iterations >= max_iterations) continue;
@@ -357,13 +362,22 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
   int images_found = 0;
   int i = 0;
   size_t copy_size = 0;
+  hipStream_t stream;
+
+  CheckHIPError(hipStreamCreate(&stream));
+  printf("Created stream id %d\n", (int) hipStreamGetInternalID(stream));
+  printf("Compute units on device: %d\n", (int) hipStreamGetComputeUnitCount(stream));
+  CheckHIPError(hipStreamSetComputeUnitMask(stream, 0x0000ffff));
+
+  double start_time = GetTimeSeconds();
 
   // First, perform the search for the random Mandelbrot images on the GPU.
   InitializeRandomSearchData(&d, iterations);
   int block_count = SEARCH_THREAD_COUNT / 256;
   if ((block_count % 256) != 0) block_count++;
-  hipLaunchKernelGGL(DoRandomSearch, block_count, 256, 0, 0, d);
-  CheckHIPError(hipDeviceSynchronize());
+  hipLaunchKernelGGL(DoRandomSearch, block_count, 256, 0, stream, d);
+  CheckHIPError(hipStreamSynchronize(stream));
+  CheckHIPError(hipStreamDestroy(stream));
 
   // Next, copy the found image locations to the host.
   copy_size = SEARCH_THREAD_COUNT * sizeof(double);
@@ -378,6 +392,8 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
   CheckHIPError(hipMemcpy(host_iterations, d.iterations_needed, copy_size,
     hipMemcpyDeviceToHost));
   CleanupRandomSearchData(&d);
+
+  printf("The random search took %f seconds.\n", GetTimeSeconds() - start_time);
 
   // Next, iterate over the found locations and initialize the Mandelbrot-set
   // image structs with the correct locations. (Note that it's pointless to set
@@ -639,7 +655,7 @@ static void SetupDevice(void) {
 }
 
 int main(int argc, char **argv) {
-  int count, resolution, rng_seed;
+  int count, resolution;
   if (argc != 4) {
     printf("Usage: %s <max # of images> <image width> <output directory>\n",
       argv[0]);
