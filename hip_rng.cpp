@@ -38,7 +38,7 @@ __device__ double UniformDouble(RNGState *rng) {
   return ((double) combined) / ((double) ((uint64_t) -1));
 }
 
-__global__ void InitRNGState(uint64_t seed, int index, RNGState *s) {
+__device__ void InitRNGState(uint64_t seed, int index, RNGState *s) {
   int i;
   for (i = 0; i < index; i++) {
     seed = IncrementPastZero(seed);

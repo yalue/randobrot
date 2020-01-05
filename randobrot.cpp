@@ -196,6 +196,7 @@ static void InitializeRandomSearchData(RandomSearchData *d,
   CheckHIPError(hipMemset(d->imag_locations, 0, count * sizeof(double)));
   CheckHIPError(hipMalloc(&(d->iterations_needed), count * sizeof(uint32_t)));
   CheckHIPError(hipMemset(d->iterations_needed, 0, count * sizeof(uint32_t)));
+  CheckHIPError(hipDeviceSynchronize());
   d->iterations = *c;
   hipLaunchKernelGGL(InitializeRNG, block_count, 256, 0, 0, GetRNGSeed(),
     d->rng_states);
@@ -362,22 +363,15 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
   int images_found = 0;
   int i = 0;
   size_t copy_size = 0;
-  hipStream_t stream;
-
-  CheckHIPError(hipStreamCreate(&stream));
-  printf("Created stream id %d\n", (int) hipStreamGetInternalID(stream));
-  printf("Compute units on device: %d\n", (int) hipStreamGetComputeUnitCount(stream));
-  CheckHIPError(hipStreamSetComputeUnitMask(stream, 0x0000ffff));
-
   double start_time = GetTimeSeconds();
 
   // First, perform the search for the random Mandelbrot images on the GPU.
   InitializeRandomSearchData(&d, iterations);
   int block_count = SEARCH_THREAD_COUNT / 256;
   if ((block_count % 256) != 0) block_count++;
-  hipLaunchKernelGGL(DoRandomSearch, block_count, 256, 0, stream, d);
-  CheckHIPError(hipStreamSynchronize(stream));
-  CheckHIPError(hipStreamDestroy(stream));
+  hipLaunchKernelGGL(DoRandomSearch, block_count, 256, 0, 0, d);
+  CheckHIPError(hipDeviceSynchronize());
+
 
   // Next, copy the found image locations to the host.
   copy_size = SEARCH_THREAD_COUNT * sizeof(double);
@@ -391,6 +385,7 @@ static int GetRandomImages(MandelbrotImage *images, int max_images,
   CheckHIPError(hipHostMalloc(&host_iterations, copy_size));
   CheckHIPError(hipMemcpy(host_iterations, d.iterations_needed, copy_size,
     hipMemcpyDeviceToHost));
+  CheckHIPError(hipDeviceSynchronize());
   CleanupRandomSearchData(&d);
 
   printf("The random search took %f seconds.\n", GetTimeSeconds() - start_time);
