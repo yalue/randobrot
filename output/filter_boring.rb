@@ -24,14 +24,27 @@ def is_boring(pic)
   too_black || too_white
 end
 
-files = Dir["./*.png"]
-files.each do |f|
-  pic = ChunkyPNG::Image.from_file(f)
-  base_name = File.basename(f)
-  if is_boring(pic)
-    puts "#{base_name} is boring"
-    `mv "#{base_name}" "./boring_pics/#{base_name}"`
-  else
-    puts "#{base_name} is OK"
+def process_file_array(files)
+  files.each do |f|
+    pic = ChunkyPNG::Image.from_file(f)
+    base_name = File.basename(f)
+    if is_boring(pic)
+      puts "#{base_name} is boring"
+      #`mv "#{base_name}" "./boring_pics/#{base_name}"`
+      `rm "#{base_name}"`
+    else
+      puts "#{base_name} is OK"
+    end
   end
 end
+
+files = Dir["./*.png"]
+threads = []
+files.each_slice(files.size / 10) do |array|
+  threads << Thread.new do
+    process_file_array(array)
+  end
+end
+puts "Waiting for threads to finish..."
+threads.each {|t| t.join()}
+

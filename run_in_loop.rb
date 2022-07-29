@@ -7,12 +7,12 @@ def count_images()
 end
 
 start_time = Time.now
-loops_to_run = 100
+loops_to_run = 1000
 prev_count = count_images()
 loops_to_run.times do |t|
   loop_start_time = Time.now
   puts "Running instance #{(t + 1).to_s} of #{loops_to_run}..."
-  puts `./randobrot 9999 1000 ./output/`
+  puts `./randobrot 200 1024 ./output/`
   puts "Converting colors."
   puts `cd ./output/ && ruby convert_all.rb`
   total_count = count_images()
